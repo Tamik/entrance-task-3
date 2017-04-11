@@ -1,16 +1,34 @@
+/* jshint esversion: 6 */
+
 'use strict';
 /**
  * @file
  * Сервис-воркер, обеспечивающий оффлайновую работу избранного
  */
 
-const CACHE_VERSION = '1.0.0-broken';
+const CACHE_VERSION = '1.0.0';
 
-importScripts('../vendor/kv-keeper.js-1.0.4/kv-keeper.js');
+const ROOT_CACHE = [
+	'/gifs.html',
+	'/assets/blocks.js',
+	'/assets/templates.js',
+	'/assets/star.svg',
+	'/assets/style.css',
+	'/vendor/bem-components-dist-5.0.0/touch-phone/bem-components.dev.js',
+	'/vendor/bem-components-dist-5.0.0/touch-phone/bem-components.dev.css',
+	'/vendor/kv-keeper.js-1.0.4/kv-keeper.js',
+	'/vendor/kv-keeper.js-1.0.4/kv-keeper.typedef.js',
+	'https://yastatic.net/jquery/3.1.0/jquery.min.js'
+];
+
+let brokenFavorites = [];
+
+importScripts('/vendor/kv-keeper.js-1.0.4/kv-keeper.js');
 
 
 self.addEventListener('install', event => {
-    const promise = preCacheAllFavorites()
+	const promise = preCache()
+		.then(() => preCacheAllFavorites())
         // Вопрос №1: зачем нужен этот вызов?
         .then(() => self.skipWaiting())
         .then(() => console.log('[ServiceWorker] Installed!'));
@@ -31,20 +49,20 @@ self.addEventListener('activate', event => {
 });
 
 self.addEventListener('fetch', event => {
-    const url = new URL(event.request.url);
-
     // Вопрос №3: для всех ли случаев подойдёт такое построение ключа?
-    const cacheKey = url.origin + url.pathname;
+	const url = new URL(event.request.url);
+	const cacheKey = url.origin + url.pathname;
 
-    let response;
-    if (needStoreForOffline(cacheKey)) {
-        response = caches.match(cacheKey)
-            .then(cacheResponse => cacheResponse || fetchAndPutToCache(cacheKey, event.request));
-    } else {
-        response = fetchWithFallbackToCache(event.request);
-    }
+	let response;
+	// Проверяем, надо ли кэшировать запрос
+	if(brokenFavorites.includes(cacheKey)) {
+		response = fetchAndPutToCache(cacheKey, event.request);
+	}
+	else {
+		response = fetchWithFallbackToCache(event.request);
+	}
 
-    event.respondWith(response);
+	event.respondWith(response);
 });
 
 self.addEventListener('message', event => {
@@ -123,13 +141,6 @@ function deleteObsoleteCaches() {
         });
 }
 
-// Нужно ли при скачивании сохранять ресурс для оффлайна?
-function needStoreForOffline(cacheKey) {
-    return cacheKey.includes('vendor/') ||
-        cacheKey.includes('assets/') ||
-        cacheKey.endsWith('jquery.min.js');
-}
-
 // Скачать и добавить в кеш
 function fetchAndPutToCache(cacheKey, request) {
     return fetch(request)
@@ -137,7 +148,13 @@ function fetchAndPutToCache(cacheKey, request) {
             return caches.open(CACHE_VERSION)
                 .then(cache => {
                     // Вопрос №5: для чего нужно клонирование?
-                    cache.put(cacheKey, response.clone());
+                    cache.put(cacheKey, response.clone())
+						.then(() => {
+							let brokenFavoritesIndex = brokenFavorites.indexOf(cacheKey);
+							if(brokenFavoritesIndex !== -1) {
+								brokenFavorites.splice(brokenFavoritesIndex, 1);
+							}
+						});
                 })
                 .then(() => response);
         })
@@ -152,13 +169,16 @@ function fetchWithFallbackToCache(request) {
     return fetch(request)
         .catch(() => {
             console.log('[ServiceWorker] Fallback to offline cache:', request.url);
-            return caches.match(request.url);
+			const url = new URL(request.url);
+			const cacheKey = url.origin + url.pathname;
+			return caches.match(cacheKey);
         });
 }
 
 // Обработать сообщение от клиента
 const messageHandlers = {
-    'favorite:add': handleFavoriteAdd
+    'favorite:add': handleFavoriteAdd,
+	'favorite:remove': handleFavoriteRemove
 };
 
 function handleMessage(eventData) {
@@ -187,6 +207,33 @@ function handleFavoriteAdd(id, data) {
                     return Promise.all(
                         responses.map(response => cache.put(response.url, response))
                     );
-                });
+                })
+				// При неудачном кэшировании сохраняем элемент в массив brokenFavorites, и закэшируем при след. возможности
+				.catch((response) => {
+					urls.forEach(url => brokenFavorites.push(url));
+					console.log('[ServiceWorker] Broken Favorite added');
+				});
         });
+}
+
+// Обработать сообщение об удалении картинки из избранного
+function handleFavoriteRemove(id, data) {
+	return caches.open(CACHE_VERSION)
+		.then(cache => {
+			const urls = [].concat(
+				data.fallback,
+				(data.sources || []).map(item => item.url)
+			);
+
+			return Promise
+				.all(urls.map(url => cache.delete(url)))
+		});
+}
+
+// Кэширование статических файлов
+function preCache() {
+	return caches.open(CACHE_VERSION)
+		.then(cache => {
+			return cache.addAll(ROOT_CACHE);
+		});
 }
